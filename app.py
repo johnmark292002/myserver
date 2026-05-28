@@ -21,55 +21,62 @@ ALLOWED_EXTENSIONS = {'jpg', 'jpeg', 'png', 'webp', 'bmp', 'tiff'}
 
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
-# ----------------------- DNN Super‑Resolution Setup -----------------------
-# We'll download the EDSR model (x4) on first use
-MODEL_PATH = "EDSR_x4.pb"
-MODEL_URL = "https://github.com/Saafke/EDSR_Tensorflow/blob/master/models/EDSR_x4.pb?raw=true"
-
-if not os.path.exists(MODEL_PATH):
-    import urllib.request
-    print(f"Downloading EDSR model (~40 MB)...")
-    urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
-
-# Create DNN super‑res object once (thread‑safe to reuse)
-sr = cv2.dnn_superres.DnnSuperResImpl_create()
-sr.readModel(MODEL_PATH)
-sr.setModel("edsr", 4)   # 4x upscaling
-
-# Face cascade (built‑in)
+# Face detector (built-in)
 face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
 
-def enhance_with_dnn(image_bytes):
-    """Apply DNN super‑resolution, then face smoothing, then sharpening."""
-    # Decode original image
-    img_np = cv2.imdecode(np.frombuffer(image_bytes, np.uint8), cv2.IMREAD_COLOR)
-    if img_np is None:
-        raise ValueError("Could not decode image")
+def strong_enhancement(img_np):
+    """
+    Applies a professional pipeline without external models:
+    - Denoising (non-local means)
+    - CLAHE contrast enhancement
+    - Bilateral filter (skin smoothing)
+    - Face‑targeted smoothing
+    - Strong sharpening
+    - Vibrance boost
+    """
+    # 1. Convert to BGR for OpenCV
+    img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
 
-    # 1. Super‑resolution (x4)
-    upscaled = sr.upsample(img_np)
+    # 2. Denoise (non‑local means, preserves edges)
+    denoised = cv2.fastNlMeansDenoisingColored(img_bgr, None, 10, 10, 7, 21)
 
-    # 2. Face detection & smoothing on the upscaled result
-    gray = cv2.cvtColor(upscaled, cv2.COLOR_BGR2GRAY)
-    faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(40, 40))
-    for (x, y, w, h) in faces:
-        face_roi = upscaled[y:y+h, x:x+w]
-        # Bilateral filter for natural skin smoothing
-        face_roi = cv2.bilateralFilter(face_roi, d=9, sigmaColor=75, sigmaSpace=75)
-        # Sharpening kernel on the face
-        kernel = np.array([[-1,-1,-1], [-1,9,-1], [-1,-1,-1]])
-        face_roi = cv2.filter2D(face_roi, -1, kernel)
-        upscaled[y:y+h, x:x+w] = face_roi
-
-    # 3. Final contrast & vibrance boost
-    lab = cv2.cvtColor(upscaled, cv2.COLOR_BGR2LAB)
+    # 3. CLAHE (improves local contrast)
+    lab = cv2.cvtColor(denoised, cv2.COLOR_BGR2LAB)
     l, a, b = cv2.split(lab)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
     l = clahe.apply(l)
     lab = cv2.merge((l, a, b))
-    enhanced = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+    contrasted = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
 
-    return enhanced
+    # 4. Bilateral filter (smooths skin, keeps edges)
+    smoothed = cv2.bilateralFilter(contrasted, d=9, sigmaColor=75, sigmaSpace=75)
+
+    # 5. Face detection & extra smoothing
+    gray = cv2.cvtColor(smoothed, cv2.COLOR_BGR2GRAY)
+    faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(60, 60))
+    for (x, y, w, h) in faces:
+        face_roi = smoothed[y:y+h, x:x+w]
+        # Stronger bilateral filter on face
+        face_smooth = cv2.bilateralFilter(face_roi, d=15, sigmaColor=80, sigmaSpace=80)
+        # Blend: 70% smoothed, 30% original to avoid plastic look
+        smoothed[y:y+h, x:x+w] = cv2.addWeighted(face_smooth, 0.7, face_roi, 0.3, 0)
+
+    # 6. Strong sharpening kernel
+    kernel = np.array([[-1,-1,-1],
+                       [-1, 9,-1],
+                       [-1,-1,-1]])
+    sharpened = cv2.filter2D(smoothed, -1, kernel)
+
+    # 7. Vibrance boost (HSV)
+    hsv = cv2.cvtColor(sharpened, cv2.COLOR_BGR2HSV)
+    h, s, v = cv2.split(hsv)
+    s = cv2.add(s, 12)  # increase saturation
+    s = np.clip(s, 0, 255).astype(np.uint8)
+    hsv = cv2.merge((h, s, v))
+    final_bgr = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
+
+    # Convert back to RGB for PIL
+    return cv2.cvtColor(final_bgr, cv2.COLOR_BGR2RGB)
 
 # ----------------------- Job Queue -----------------------
 jobs = {}
@@ -88,11 +95,15 @@ def process_job(job):
             orig_ext = orig_name.rsplit('.',1)[-1].lower()
             with open(os.path.join(UPLOAD_FOLDER, f"{uid}_original.{orig_ext}"), 'wb') as f:
                 f.write(img_bytes)
+            # Load image with PIL and convert to numpy array
+            pil_img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
+            img_np = np.array(pil_img)
             # Enhance
-            enhanced_bgr = enhance_with_dnn(img_bytes)
-            # Save enhanced as JPEG (quality 95)
+            enhanced_np = strong_enhancement(img_np)
+            # Convert back to PIL and save as JPEG quality 95
+            enhanced_pil = Image.fromarray(enhanced_np)
             enhanced_path = os.path.join(UPLOAD_FOLDER, f"{uid}_enhanced.jpg")
-            cv2.imwrite(enhanced_path, enhanced_bgr, [cv2.IMWRITE_JPEG_QUALITY, 95])
+            enhanced_pil.save(enhanced_path, 'JPEG', quality=95)
             results.append({
                 'original_url': f"/uploads/{uid}_original.{orig_ext}",
                 'enhanced_url': f"/uploads/{uid}_enhanced.jpg",
