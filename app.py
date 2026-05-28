@@ -3,22 +3,15 @@ import uuid
 import time
 import threading
 import io
-import json
 from pathlib import Path
 from queue import Queue
 from flask import Flask, request, jsonify, send_from_directory, abort
 from flask_cors import CORS
 from PIL import Image
-
-# Real-ESRGAN imports
-from basicsr.archs.rrdbnet_arch import RRDBNet
-from realesrgan import RealESRGANer
 import cv2
 import numpy as np
 
 app = Flask(__name__)
-
-# ✅ Allow your Netlify domain
 CORS(app, origins=['https://personal-filesarchive.netlify.app'])
 
 UPLOAD_FOLDER = "uploads"
@@ -28,86 +21,92 @@ ALLOWED_EXTENSIONS = {'jpg', 'jpeg', 'png', 'webp', 'bmp', 'tiff'}
 
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
+# ----------------------- DNN Super‑Resolution Setup -----------------------
+# We'll download the EDSR model (x4) on first use
+MODEL_PATH = "EDSR_x4.pb"
+MODEL_URL = "https://github.com/Saafke/EDSR_Tensorflow/blob/master/models/EDSR_x4.pb?raw=true"
+
+if not os.path.exists(MODEL_PATH):
+    import urllib.request
+    print(f"Downloading EDSR model (~40 MB)...")
+    urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
+
+# Create DNN super‑res object once (thread‑safe to reuse)
+sr = cv2.dnn_superres.DnnSuperResImpl_create()
+sr.readModel(MODEL_PATH)
+sr.setModel("edsr", 4)   # 4x upscaling
+
+# Face cascade (built‑in)
+face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+
+def enhance_with_dnn(image_bytes):
+    """Apply DNN super‑resolution, then face smoothing, then sharpening."""
+    # Decode original image
+    img_np = cv2.imdecode(np.frombuffer(image_bytes, np.uint8), cv2.IMREAD_COLOR)
+    if img_np is None:
+        raise ValueError("Could not decode image")
+
+    # 1. Super‑resolution (x4)
+    upscaled = sr.upsample(img_np)
+
+    # 2. Face detection & smoothing on the upscaled result
+    gray = cv2.cvtColor(upscaled, cv2.COLOR_BGR2GRAY)
+    faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(40, 40))
+    for (x, y, w, h) in faces:
+        face_roi = upscaled[y:y+h, x:x+w]
+        # Bilateral filter for natural skin smoothing
+        face_roi = cv2.bilateralFilter(face_roi, d=9, sigmaColor=75, sigmaSpace=75)
+        # Sharpening kernel on the face
+        kernel = np.array([[-1,-1,-1], [-1,9,-1], [-1,-1,-1]])
+        face_roi = cv2.filter2D(face_roi, -1, kernel)
+        upscaled[y:y+h, x:x+w] = face_roi
+
+    # 3. Final contrast & vibrance boost
+    lab = cv2.cvtColor(upscaled, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+    l = clahe.apply(l)
+    lab = cv2.merge((l, a, b))
+    enhanced = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+
+    return enhanced
+
 # ----------------------- Job Queue -----------------------
-jobs = {}                # job_id -> job info dict
+jobs = {}
 job_queue = Queue()
 job_lock = threading.Lock()
 
 def process_job(job):
-    """Worker thread function – runs Real-ESRGAN and face enhancement on a job."""
     job_id = job['job_id']
-    results = []
     try:
         with job_lock:
             jobs[job_id]['status'] = 'processing'
-
-        # ---------- Real-ESRGAN upscaler (x4) ----------
-        model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=23, num_grow_ch=32, scale=4)
-        upsampler = RealESRGANer(
-            scale=4,
-            model_path=None,                     # automatically downloads pretrained model
-            model=model,
-            tile=0,
-            tile_pad=10,
-            pre_pad=0,
-            half=False                           # set True if GPU available
-        )
-
+        results = []
         for idx, (orig_name, img_bytes) in enumerate(job['images']):
-            # Save original
             uid = f"{job_id}_{idx}"
-            with open(os.path.join(UPLOAD_FOLDER, f"{uid}_original.png"), 'wb') as f:
+            # Save original
+            orig_ext = orig_name.rsplit('.',1)[-1].lower()
+            with open(os.path.join(UPLOAD_FOLDER, f"{uid}_original.{orig_ext}"), 'wb') as f:
                 f.write(img_bytes)
-
-            # Load image with PIL and convert to numpy
-            pil_img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
-            img_np = np.array(pil_img)
-
-            # Run Real-ESRGAN (super-resolution + enhancement)
-            enhanced_np, _ = upsampler.enhance(img_np, outscale=4)  # 4x upscale
-
-            # Face enhancement using built‑in face enhancement (requires facexlib/gfpgan)
-            # We'll use RealESRGANer's face_enhance option by creating another instance, but
-            # to keep it simple we'll just use the same instance (the model supports it if we
-            # set the face_enhance flag). For production you'd use a dedicated face enhancer.
-            # Instead, we'll apply a strong bilateral filter + sharpening on detected faces
-            # as a fallback if no GPU face model is available. For now, let's use Real-ESRGAN's
-            # face_enhance argument if we load the appropriate model.
-            # Since we already have an upsampler without face_enhance, we'll do manual face boost:
-            gray = cv2.cvtColor(enhanced_np, cv2.COLOR_RGB2GRAY)
-            face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
-            faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(40, 40))
-            for (x, y, w, h) in faces:
-                face_roi = enhanced_np[y:y+h, x:x+w]
-                # Bilateral filter + sharpening on face
-                face_roi = cv2.bilateralFilter(face_roi, d=9, sigmaColor=75, sigmaSpace=75)
-                kernel = np.array([[-1,-1,-1], [-1,9,-1], [-1,-1,-1]])
-                face_roi = cv2.filter2D(face_roi, -1, kernel)
-                enhanced_np[y:y+h, x:x+w] = face_roi
-
-            # Final output: convert back to PIL and save as high-quality JPEG
-            enhanced_pil = Image.fromarray(enhanced_np)
-            enhanced_filename = f"{uid}_enhanced.jpg"
-            enhanced_pil.save(os.path.join(UPLOAD_FOLDER, enhanced_filename), 'JPEG', quality=95)
-
+            # Enhance
+            enhanced_bgr = enhance_with_dnn(img_bytes)
+            # Save enhanced as JPEG (quality 95)
+            enhanced_path = os.path.join(UPLOAD_FOLDER, f"{uid}_enhanced.jpg")
+            cv2.imwrite(enhanced_path, enhanced_bgr, [cv2.IMWRITE_JPEG_QUALITY, 95])
             results.append({
-                'original_url': f"/uploads/{uid}_original.png",
+                'original_url': f"/uploads/{uid}_original.{orig_ext}",
                 'enhanced_url': f"/uploads/{uid}_enhanced.jpg",
                 'original_name': orig_name
             })
-
         with job_lock:
             jobs[job_id]['status'] = 'done'
             jobs[job_id]['results'] = results
-
     except Exception as e:
         with job_lock:
             jobs[job_id]['status'] = 'failed'
             jobs[job_id]['error'] = str(e)
-        print(f"Job {job_id} failed: {e}")
 
 def worker():
-    """Continuously process jobs from the queue."""
     while True:
         job = job_queue.get()
         if job is None:
@@ -115,10 +114,9 @@ def worker():
         process_job(job)
         job_queue.task_done()
 
-# Start worker thread
 threading.Thread(target=worker, daemon=True).start()
 
-# ----------------------- Cleanup Thread -----------------------
+# ----------------------- Cleanup -----------------------
 def cleanup_old_files():
     now = time.time()
     for f in Path(UPLOAD_FOLDER).glob("*.*"):
@@ -141,14 +139,11 @@ def allowed_file(filename):
 
 @app.route('/api/enhance', methods=['POST'])
 def enhance_single():
-    """Upload a single image – returns a job ID."""
     if 'image' not in request.files:
         return jsonify({'success': False, 'error': 'No image file'}), 400
     file = request.files['image']
-    if file.filename == '':
-        return jsonify({'success': False, 'error': 'Empty filename'}), 400
-    if not allowed_file(file.filename):
-        return jsonify({'success': False, 'error': 'Invalid file type'}), 400
+    if not file or file.filename == '' or not allowed_file(file.filename):
+        return jsonify({'success': False, 'error': 'Invalid file'}), 400
 
     img_bytes = file.read()
     job_id = str(uuid.uuid4())
@@ -165,18 +160,13 @@ def enhance_single():
 
 @app.route('/api/enhance/bulk', methods=['POST'])
 def enhance_bulk():
-    """Upload multiple images – returns a list of job IDs."""
-    if 'images' not in request.files:
-        # Fallback: 'images' key, or multiple files with same name
-        files = request.files.getlist('images')
-        if not files:
-            return jsonify({'success': False, 'error': 'No images uploaded'}), 400
-    else:
-        files = [request.files['images']]  # single file scenario handled as list
+    files = request.files.getlist('images')
+    if not files:
+        return jsonify({'success': False, 'error': 'No images uploaded'}), 400
 
     job_ids = []
     for file in files:
-        if file.filename == '' or not allowed_file(file.filename):
+        if not file or file.filename == '' or not allowed_file(file.filename):
             continue
         img_bytes = file.read()
         job_id = str(uuid.uuid4())
@@ -195,16 +185,11 @@ def enhance_bulk():
 
 @app.route('/api/job/<job_id>', methods=['GET'])
 def job_status(job_id):
-    """Poll job status and fetch results when done."""
     with job_lock:
         job = jobs.get(job_id)
     if not job:
         return jsonify({'success': False, 'error': 'Job not found'}), 404
-    resp = {
-        'job_id': job_id,
-        'status': job['status'],
-        'error': job.get('error')
-    }
+    resp = {'job_id': job_id, 'status': job['status'], 'error': job.get('error')}
     if job['status'] == 'done':
         resp['results'] = job['results']
     return jsonify(resp)
