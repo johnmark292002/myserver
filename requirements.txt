@@ -3,8 +3,4 @@ pillow
 flask-cors
 gunicorn
 opencv-python-headless
-torch
-realesrgan
-basicsr
-facexlib
-gfpgan
+numpy
