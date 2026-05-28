@@ -2,4 +2,3 @@ flask
 pillow
 flask-cors
 gunicorn
-opencv-python-headless
