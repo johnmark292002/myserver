@@ -15,73 +15,67 @@ app = Flask(__name__)
 CORS(app, origins=['https://personal-filesarchive.netlify.app'])
 
 UPLOAD_FOLDER = "uploads"
-CLEANUP_INTERVAL = 300   # clean every 5 minutes
-IMAGE_LIFETIME = 1800    # delete after 30 minutes
+CLEANUP_INTERVAL = 60
+IMAGE_LIFETIME = 3600
 ALLOWED_EXTENSIONS = {'jpg', 'jpeg', 'png', 'webp', 'bmp', 'tiff'}
-MAX_IMAGE_SIZE = 1200     # resize long side to this value for speed
 
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
-# Face detector (built‑in)
+# Face detector (built-in)
 face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
-
-def resize_if_needed(img_np, max_dim=MAX_IMAGE_SIZE):
-    """Resize image so that the longest side <= max_dim (preserves aspect ratio)"""
-    h, w = img_np.shape[:2]
-    if max(h, w) <= max_dim:
-        return img_np
-    scale = max_dim / max(h, w)
-    new_w, new_h = int(w * scale), int(h * scale)
-    return cv2.resize(img_np, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
 
 def strong_enhancement(img_np):
     """
-    Fast yet high‑quality enhancement:
-    - Resize to reasonable dimensions
-    - Bilateral filter (denoise + skin smoothing)
+    Applies a professional pipeline without external models:
+    - Denoising (non-local means)
     - CLAHE contrast enhancement
-    - Smart sharpening (only if needed)
+    - Bilateral filter (skin smoothing)
+    - Face‑targeted smoothing
+    - Strong sharpening
     - Vibrance boost
-    - Optional light face smoothing
     """
-    # 1. Resize for speed
-    img_small = resize_if_needed(img_np)
+    # 1. Convert to BGR for OpenCV
+    img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
 
-    # 2. Convert to BGR for OpenCV
-    img_bgr = cv2.cvtColor(img_small, cv2.COLOR_RGB2BGR)
+    # 2. Denoise (non‑local means, preserves edges)
+    denoised = cv2.fastNlMeansDenoisingColored(img_bgr, None, 10, 10, 7, 21)
 
-    # 3. Bilateral filter (denoise + edge‑preserving smooth)
-    smoothed = cv2.bilateralFilter(img_bgr, d=9, sigmaColor=70, sigmaSpace=70)
-
-    # 4. CLAHE (better local contrast)
-    lab = cv2.cvtColor(smoothed, cv2.COLOR_BGR2LAB)
+    # 3. CLAHE (improves local contrast)
+    lab = cv2.cvtColor(denoised, cv2.COLOR_BGR2LAB)
     l, a, b = cv2.split(lab)
-    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
     l = clahe.apply(l)
     lab = cv2.merge((l, a, b))
     contrasted = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
 
-    # 5. Face detection + extra smoothing (optional, light)
-    gray = cv2.cvtColor(contrasted, cv2.COLOR_BGR2GRAY)
+    # 4. Bilateral filter (smooths skin, keeps edges)
+    smoothed = cv2.bilateralFilter(contrasted, d=9, sigmaColor=75, sigmaSpace=75)
+
+    # 5. Face detection & extra smoothing
+    gray = cv2.cvtColor(smoothed, cv2.COLOR_BGR2GRAY)
     faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(60, 60))
     for (x, y, w, h) in faces:
-        face_roi = contrasted[y:y+h, x:x+w]
-        face_smooth = cv2.bilateralFilter(face_roi, d=11, sigmaColor=60, sigmaSpace=60)
-        contrasted[y:y+h, x:x+w] = cv2.addWeighted(face_smooth, 0.65, face_roi, 0.35, 0)
+        face_roi = smoothed[y:y+h, x:x+w]
+        # Stronger bilateral filter on face
+        face_smooth = cv2.bilateralFilter(face_roi, d=15, sigmaColor=80, sigmaSpace=80)
+        # Blend: 70% smoothed, 30% original to avoid plastic look
+        smoothed[y:y+h, x:x+w] = cv2.addWeighted(face_smooth, 0.7, face_roi, 0.3, 0)
 
-    # 6. Sharpening (medium strength to avoid artifacts)
-    kernel = np.array([[-0.5, -0.5, -0.5],
-                       [-0.5,   5, -0.5],
-                       [-0.5, -0.5, -0.5]])
-    sharpened = cv2.filter2D(contrasted, -1, kernel)
+    # 6. Strong sharpening kernel
+    kernel = np.array([[-1,-1,-1],
+                       [-1, 9,-1],
+                       [-1,-1,-1]])
+    sharpened = cv2.filter2D(smoothed, -1, kernel)
 
-    # 7. Vibrance (gentle saturation boost)
+    # 7. Vibrance boost (HSV)
     hsv = cv2.cvtColor(sharpened, cv2.COLOR_BGR2HSV)
     h, s, v = cv2.split(hsv)
-    s = np.clip(s.astype(np.int16) + 10, 0, 255).astype(np.uint8)
+    s = cv2.add(s, 12)  # increase saturation
+    s = np.clip(s, 0, 255).astype(np.uint8)
     hsv = cv2.merge((h, s, v))
     final_bgr = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
 
+    # Convert back to RGB for PIL
     return cv2.cvtColor(final_bgr, cv2.COLOR_BGR2RGB)
 
 # ----------------------- Job Queue -----------------------
@@ -98,20 +92,18 @@ def process_job(job):
         for idx, (orig_name, img_bytes) in enumerate(job['images']):
             uid = f"{job_id}_{idx}"
             # Save original
-            orig_ext = orig_name.rsplit('.', 1)[-1].lower()
+            orig_ext = orig_name.rsplit('.',1)[-1].lower()
             with open(os.path.join(UPLOAD_FOLDER, f"{uid}_original.{orig_ext}"), 'wb') as f:
                 f.write(img_bytes)
-
-            # Load and enhance
+            # Load image with PIL and convert to numpy array
             pil_img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
             img_np = np.array(pil_img)
+            # Enhance
             enhanced_np = strong_enhancement(img_np)
-
-            # Save enhanced as JPEG (95% quality)
+            # Convert back to PIL and save as JPEG quality 95
             enhanced_pil = Image.fromarray(enhanced_np)
             enhanced_path = os.path.join(UPLOAD_FOLDER, f"{uid}_enhanced.jpg")
-            enhanced_pil.save(enhanced_path, 'JPEG', quality=92, optimize=True)
-
+            enhanced_pil.save(enhanced_path, 'JPEG', quality=95)
             results.append({
                 'original_url': f"/uploads/{uid}_original.{orig_ext}",
                 'enhanced_url': f"/uploads/{uid}_enhanced.jpg",
@@ -142,8 +134,8 @@ def cleanup_old_files():
         try:
             if now - f.stat().st_mtime > IMAGE_LIFETIME:
                 f.unlink()
-        except:
-            pass
+                print(f"[Cleanup] Deleted: {f.name}")
+        except: pass
 
 def periodic_cleanup():
     while True:
@@ -218,10 +210,6 @@ def uploaded_file(filename):
     if '..' in filename or filename.startswith('/'):
         abort(404)
     return send_from_directory(UPLOAD_FOLDER, filename)
-
-@app.route('/health')
-def health():
-    return jsonify({'status': 'ok'}), 200
 
 @app.route('/')
 def index():
