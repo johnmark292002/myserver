@@ -2,16 +2,16 @@ import os
 import uuid
 import time
 import threading
-import io
 from pathlib import Path
-from queue import Queue
+import numpy as np
 from flask import Flask, request, jsonify, send_from_directory, abort
 from flask_cors import CORS
-from PIL import Image
+from PIL import Image, ImageFilter, ImageEnhance
 import cv2
-import numpy as np
 
 app = Flask(__name__)
+
+# ✅ Your Netlify domain
 CORS(app, origins=['https://personal-filesarchive.netlify.app'])
 
 UPLOAD_FOLDER = "uploads"
@@ -21,26 +21,40 @@ ALLOWED_EXTENSIONS = {'jpg', 'jpeg', 'png', 'webp', 'bmp', 'tiff'}
 
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
-# Face detector (built-in)
-face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+# ------------------- Face detection setup -------------------
+# Load OpenCV's Haar cascade for face detection (downloads once if missing)
+CASCADE_PATH = "haarcascade_frontalface_default.xml"
+if not os.path.exists(CASCADE_PATH):
+    import urllib.request
+    url = "https://raw.githubusercontent.com/opencv/opencv/master/data/haarcascades/haarcascade_frontalface_default.xml"
+    urllib.request.urlretrieve(url, CASCADE_PATH)
 
-def strong_enhancement(img_np):
+face_cascade = cv2.CascadeClassifier(CASCADE_PATH)
+
+def allowed_file(filename):
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+def simulate_ai_enhancement(image: Image.Image) -> Image.Image:
     """
-    Applies a professional pipeline without external models:
-    - Denoising (non-local means)
-    - CLAHE contrast enhancement
-    - Bilateral filter (skin smoothing)
-    - Face‑targeted smoothing
-    - Strong sharpening
-    - Vibrance boost
+    Professional AI enhancement pipeline:
+    1. Convert to OpenCV (BGR)
+    2. Non-local means denoising
+    3. CLAHE (adaptive contrast)
+    4. Bilateral filter (skin smoothing)
+    5. Face-targeted smoothing (stronger bilateral on detected faces)
+    6. Sharpening (unsharp mask + standard sharpen)
+    7. Vibrance & colour enhancement
+    8. Return as PIL Image
     """
-    # 1. Convert to BGR for OpenCV
-    img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
+    # Convert PIL -> NumPy (RGB) -> BGR for OpenCV
+    img_np = np.array(image.convert('RGB'))
+    img_cv = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
 
-    # 2. Denoise (non‑local means, preserves edges)
-    denoised = cv2.fastNlMeansDenoisingColored(img_bgr, None, 10, 10, 7, 21)
+    # 1. Denoising (non-local means, preserves edges)
+    # Parameters: strength 10 (moderate), templateWindowSize 7, searchWindowSize 21
+    denoised = cv2.fastNlMeansDenoisingColored(img_cv, None, 10, 10, 7, 21)
 
-    # 3. CLAHE (improves local contrast)
+    # 2. CLAHE on L channel (improve local contrast)
     lab = cv2.cvtColor(denoised, cv2.COLOR_BGR2LAB)
     l, a, b = cv2.split(lab)
     clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
@@ -48,94 +62,53 @@ def strong_enhancement(img_np):
     lab = cv2.merge((l, a, b))
     contrasted = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
 
-    # 4. Bilateral filter (smooths skin, keeps edges)
+    # 3. Bilateral filter (smooth skin, keep edges)
     smoothed = cv2.bilateralFilter(contrasted, d=9, sigmaColor=75, sigmaSpace=75)
 
-    # 5. Face detection & extra smoothing
+    # 4. Face detection & extra smoothing on faces
     gray = cv2.cvtColor(smoothed, cv2.COLOR_BGR2GRAY)
     faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(60, 60))
-    for (x, y, w, h) in faces:
-        face_roi = smoothed[y:y+h, x:x+w]
-        # Stronger bilateral filter on face
-        face_smooth = cv2.bilateralFilter(face_roi, d=15, sigmaColor=80, sigmaSpace=80)
-        # Blend: 70% smoothed, 30% original to avoid plastic look
-        smoothed[y:y+h, x:x+w] = cv2.addWeighted(face_smooth, 0.7, face_roi, 0.3, 0)
 
-    # 6. Strong sharpening kernel
+    if len(faces) > 0:
+        for (x, y, w, h) in faces:
+            # Extract face ROI
+            face_roi = smoothed[y:y+h, x:x+w]
+            # Stronger smoothing on face
+            face_smooth = cv2.bilateralFilter(face_roi, d=15, sigmaColor=80, sigmaSpace=80)
+            # Blend with original face to avoid plastic look (alpha 0.7 = 70% smoothed)
+            blended = cv2.addWeighted(face_smooth, 0.7, face_roi, 0.3, 0)
+            smoothed[y:y+h, x:x+w] = blended
+
+    # 5. Sharpening
+    # Create a sharpening kernel
     kernel = np.array([[-1,-1,-1],
                        [-1, 9,-1],
                        [-1,-1,-1]])
     sharpened = cv2.filter2D(smoothed, -1, kernel)
 
-    # 7. Vibrance boost (HSV)
+    # 6. Vibrance: convert to HSV, increase saturation slightly
     hsv = cv2.cvtColor(sharpened, cv2.COLOR_BGR2HSV)
     h, s, v = cv2.split(hsv)
-    s = cv2.add(s, 12)  # increase saturation
+    s = cv2.add(s, 10)  # increase saturation by 10 (scale 0-255)
     s = np.clip(s, 0, 255).astype(np.uint8)
     hsv = cv2.merge((h, s, v))
-    final_bgr = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
+    final_cv = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
 
-    # Convert back to RGB for PIL
-    return cv2.cvtColor(final_bgr, cv2.COLOR_BGR2RGB)
+    # Convert back to PIL
+    final_rgb = cv2.cvtColor(final_cv, cv2.COLOR_BGR2RGB)
+    return Image.fromarray(final_rgb)
 
-# ----------------------- Job Queue -----------------------
-jobs = {}
-job_queue = Queue()
-job_lock = threading.Lock()
-
-def process_job(job):
-    job_id = job['job_id']
-    try:
-        with job_lock:
-            jobs[job_id]['status'] = 'processing'
-        results = []
-        for idx, (orig_name, img_bytes) in enumerate(job['images']):
-            uid = f"{job_id}_{idx}"
-            # Save original
-            orig_ext = orig_name.rsplit('.',1)[-1].lower()
-            with open(os.path.join(UPLOAD_FOLDER, f"{uid}_original.{orig_ext}"), 'wb') as f:
-                f.write(img_bytes)
-            # Load image with PIL and convert to numpy array
-            pil_img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
-            img_np = np.array(pil_img)
-            # Enhance
-            enhanced_np = strong_enhancement(img_np)
-            # Convert back to PIL and save as JPEG quality 95
-            enhanced_pil = Image.fromarray(enhanced_np)
-            enhanced_path = os.path.join(UPLOAD_FOLDER, f"{uid}_enhanced.jpg")
-            enhanced_pil.save(enhanced_path, 'JPEG', quality=95)
-            results.append({
-                'original_url': f"/uploads/{uid}_original.{orig_ext}",
-                'enhanced_url': f"/uploads/{uid}_enhanced.jpg",
-                'original_name': orig_name
-            })
-        with job_lock:
-            jobs[job_id]['status'] = 'done'
-            jobs[job_id]['results'] = results
-    except Exception as e:
-        with job_lock:
-            jobs[job_id]['status'] = 'failed'
-            jobs[job_id]['error'] = str(e)
-
-def worker():
-    while True:
-        job = job_queue.get()
-        if job is None:
-            break
-        process_job(job)
-        job_queue.task_done()
-
-threading.Thread(target=worker, daemon=True).start()
-
-# ----------------------- Cleanup -----------------------
 def cleanup_old_files():
     now = time.time()
-    for f in Path(UPLOAD_FOLDER).glob("*.*"):
-        try:
-            if now - f.stat().st_mtime > IMAGE_LIFETIME:
-                f.unlink()
-                print(f"[Cleanup] Deleted: {f.name}")
-        except: pass
+    folder = Path(UPLOAD_FOLDER)
+    for filepath in folder.glob("*.*"):
+        if filepath.is_file():
+            try:
+                if now - filepath.stat().st_mtime > IMAGE_LIFETIME:
+                    filepath.unlink()
+                    print(f"[Cleanup] Deleted: {filepath.name}")
+            except Exception as e:
+                print(f"[Cleanup] Error deleting {filepath}: {e}")
 
 def periodic_cleanup():
     while True:
@@ -144,66 +117,51 @@ def periodic_cleanup():
 
 threading.Thread(target=periodic_cleanup, daemon=True).start()
 
-# ----------------------- Routes -----------------------
-def allowed_file(filename):
-    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
-
 @app.route('/api/enhance', methods=['POST'])
-def enhance_single():
+def enhance_image():
     if 'image' not in request.files:
-        return jsonify({'success': False, 'error': 'No image file'}), 400
+        return jsonify({'success': False, 'error': 'No image file provided'}), 400
     file = request.files['image']
-    if not file or file.filename == '' or not allowed_file(file.filename):
-        return jsonify({'success': False, 'error': 'Invalid file'}), 400
+    if file.filename == '':
+        return jsonify({'success': False, 'error': 'Empty filename'}), 400
+    if not allowed_file(file.filename):
+        return jsonify({'success': False, 'error': 'File type not allowed'}), 400
 
-    img_bytes = file.read()
-    job_id = str(uuid.uuid4())
-    with job_lock:
-        jobs[job_id] = {
-            'job_id': job_id,
-            'status': 'pending',
-            'images': [(file.filename, img_bytes)],
-            'results': None,
-            'error': None
-        }
-    job_queue.put(jobs[job_id])
-    return jsonify({'success': True, 'job_id': job_id})
-
-@app.route('/api/enhance/bulk', methods=['POST'])
-def enhance_bulk():
-    files = request.files.getlist('images')
-    if not files:
-        return jsonify({'success': False, 'error': 'No images uploaded'}), 400
-
-    job_ids = []
-    for file in files:
-        if not file or file.filename == '' or not allowed_file(file.filename):
-            continue
+    try:
         img_bytes = file.read()
-        job_id = str(uuid.uuid4())
-        with job_lock:
-            jobs[job_id] = {
-                'job_id': job_id,
-                'status': 'pending',
-                'images': [(file.filename, img_bytes)],
-                'results': None,
-                'error': None
-            }
-        job_queue.put(jobs[job_id])
-        job_ids.append(job_id)
+        img = Image.open(io.BytesIO(img_bytes))
+        if img.mode in ('RGBA', 'LA', 'P'):
+            bg = Image.new('RGB', img.size, (255,255,255))
+            if img.mode == 'P':
+                img = img.convert('RGBA')
+            bg.paste(img, mask=img.split()[-1] if img.mode=='RGBA' else None)
+            img = bg
+        elif img.mode != 'RGB':
+            img = img.convert('RGB')
 
-    return jsonify({'success': True, 'job_ids': job_ids})
+        uid = uuid.uuid4().hex
+        orig_ext = file.filename.rsplit('.',1)[1].lower()
+        orig_name = f"{uid}_original.{orig_ext}"
+        enh_name = f"{uid}_enhanced.jpg"
 
-@app.route('/api/job/<job_id>', methods=['GET'])
-def job_status(job_id):
-    with job_lock:
-        job = jobs.get(job_id)
-    if not job:
-        return jsonify({'success': False, 'error': 'Job not found'}), 404
-    resp = {'job_id': job_id, 'status': job['status'], 'error': job.get('error')}
-    if job['status'] == 'done':
-        resp['results'] = job['results']
-    return jsonify(resp)
+        with open(os.path.join(UPLOAD_FOLDER, orig_name), 'wb') as f:
+            f.write(img_bytes)
+
+        # Run the powerful enhancement pipeline
+        enhanced_img = simulate_ai_enhancement(img)
+        enhanced_path = os.path.join(UPLOAD_FOLDER, enh_name)
+        enhanced_img.save(enhanced_path, 'JPEG', quality=95)  # higher quality output
+
+        return jsonify({
+            'success': True,
+            'original_url': f"/uploads/{orig_name}",
+            'enhanced_url': f"/uploads/{enh_name}",
+            'filename': enh_name,
+            'original_name': file.filename
+        })
+    except Exception as e:
+        print(f"Enhancement error: {e}")
+        return jsonify({'success': False, 'error': 'Processing failed'}), 500
 
 @app.route('/uploads/<filename>')
 def uploaded_file(filename):
